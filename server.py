@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 import itertools
 import json
 import os
+import secrets
+from http import HTTPStatus
 import time
 
 from websockets.asyncio.server import serve
@@ -11,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 
 MAX_USERS = 64
 INVITE_SECONDS = 40
+RECONNECT_SECONDS = 45
 ids = itertools.count(1)
 
 
@@ -21,6 +24,11 @@ class Player:
     name: str = ""
     invitation: int = 0
     match: int = 0
+    token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    timeout: asyncio.TimerHandle | None = None
+    incoming_seq: int = 0
+    outgoing_seq: int = 0
+    replay: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -31,6 +39,7 @@ class Invitation:
 
 
 players: dict[int, Player] = {}
+sessions: dict[str, int] = {}
 invitations: dict[int, Invitation] = {}
 matches: dict[int, list[int]] = {}
 MATCH_TO_HOST = {"action_request", "action_done", "payment_request"}
@@ -64,11 +73,56 @@ def valid_event(event, data):
 
 def send(player_id, message):
     player = players.get(player_id)
-    if player:
+    if not player:
+        return
+    if message["type"] in {"start", "match", "match_ended"}:
+        player.outgoing_seq += 1
+        message = {**message, "seq": player.outgoing_seq}
+        player.replay[player.outgoing_seq] = message
+        if len(player.replay) > 128:
+            # A stalled session cannot safely replay an unbounded match history.
+            asyncio.get_running_loop().call_soon(expire_player, player_id)
+            return
+    deliver(player, message)
+
+
+def deliver(player, message):
+    if player.connection is not None:
         try:
             player.outbox.put_nowait(message)
         except asyncio.QueueFull:
             asyncio.create_task(player.connection.close(1013, "Connection too slow"))
+
+
+def acknowledge(player, sequence):
+    if type(sequence) is int and 0 <= sequence <= player.outgoing_seq:
+        for previous in list(player.replay):
+            if previous <= sequence:
+                del player.replay[previous]
+
+
+def match_presence(match_id):
+    roster = matches.get(match_id, [])
+    disconnected = [pid for pid in roster if players[pid].connection is None]
+    for pid in roster:
+        send(pid, {"type": "match_presence", "disconnected": disconnected})
+
+
+def expire_player(pid):
+    player = players.get(pid)
+    if player is None:
+        return
+    if player.timeout:
+        player.timeout.cancel()
+    if player.invitation:
+        end_invitation(player.invitation, "A player went offline.")
+    if player.match:
+        end_match(pid)
+    sessions.pop(player.token, None)
+    players.pop(pid, None)
+    if player.connection is not None:
+        asyncio.create_task(player.connection.close(1013, "Session closed"))
+    presence()
 
 
 def notice(player_id, message):
@@ -76,8 +130,8 @@ def notice(player_id, message):
 
 
 def presence():
-    roster = [{"id": pid, "name": p.name, "state": "Playing" if p.match else
-               ("Invitation" if p.invitation else "Available")}
+    roster = [{"id": pid, "name": p.name, "state": "Reconnecting" if p.connection is None else ("Playing" if p.match else
+               ("Invitation" if p.invitation else "Available"))}
               for pid, p in players.items() if p.name]
     for pid, p in players.items():
         if p.name and not p.match:
@@ -109,7 +163,7 @@ def invite_players(pid, targets):
     members = [pid, *targets]
     for member in members:
         p = players.get(member)
-        if not p or not p.name or p.match or p.invitation:
+        if not p or not p.name or p.match or p.invitation or p.connection is None:
             notice(pid, "One of the selected players is no longer available.")
             return
     invite_id = next(ids)
@@ -171,18 +225,29 @@ def dispatch(pid, message):
         name = message.get("name")
         if isinstance(name, str):
             p.name = ("".join(c for c in name if c.isprintable()).strip()[:18] or "Player") + f" #{pid}"
-            send(pid, {"type": "welcome", "id": pid, "name": p.name})
+            send(pid, {"type": "welcome", "id": pid, "name": p.name, "token": p.token})
             presence()
         return
     if not p.name:
         return
-    if kind == "invite":
+    if kind == "heartbeat":
+        send(pid, {"type": "heartbeat"})
+    elif kind == "ack":
+        acknowledge(p, message.get("seq"))
+    elif kind == "invite":
         invite_players(pid, message.get("targets"))
     elif kind == "respond" and type(message.get("accept")) is bool and message.get("id") == p.invitation:
         respond(pid, message["accept"])
     elif kind == "leave_match" and p.match:
         end_match(pid)
     elif kind == "match" and p.match:
+        sequence = message.get("client_seq")
+        if type(sequence) is not int or not 1 <= sequence <= p.incoming_seq + 1:
+            return
+        send(pid, {"type": "client_ack", "seq": sequence})
+        if sequence <= p.incoming_seq:
+            return
+        p.incoming_seq = sequence
         event = message.get("event")
         data = message.get("data")
         if not valid_event(event, data):
@@ -197,53 +262,95 @@ def dispatch(pid, message):
                 send(member, payload)
 
 
-async def writer(player):
+async def writer(connection, outbox):
     while True:
-        await player.connection.send(json.dumps(await player.outbox.get(), ensure_ascii=False))
+        await connection.send(json.dumps(await outbox.get(), ensure_ascii=False))
+
+
+def decode(raw):
+    try:
+        message = json.loads(raw)
+        return message if isinstance(message, dict) else {}
+    except (ValueError, UnicodeError):
+        return {}
 
 
 async def connection_handler(connection):
-    if len(players) >= MAX_USERS:
-        await connection.close(1013, "Lobby is full")
-        return
-    pid = next(ids)
-    player = players[pid] = Player(connection)
-    send_task = asyncio.create_task(writer(player))
-    rate_window = time.monotonic()
-    messages = 0
+    pid = None
+    send_task = None
+    player = None
     try:
+        first = decode(await asyncio.wait_for(connection.recv(), 12))
+        if first.get("type") == "resume":
+            token = first.get("token")
+            pid = sessions.get(token) if isinstance(token, str) else None
+            player = players.get(pid)
+            if not player or player.connection is not None:
+                await connection.send(json.dumps({
+                    "type": "resume_failed", "retry": bool(player),
+                }))
+                return
+            player.timeout.cancel()
+            player.timeout = None
+            player.connection = connection
+            player.outbox = asyncio.Queue(192)
+            acknowledge(player, first.get("last_seq"))
+            deliver(player, {"type": "resumed", "ack": player.incoming_seq})
+            for message in player.replay.values():
+                deliver(player, message)
+            match_presence(player.match)
+            presence()
+        elif first.get("type") == "hello" and len(players) < MAX_USERS:
+            pid = next(ids)
+            player = players[pid] = Player(connection)
+            sessions[player.token] = pid
+            dispatch(pid, first)
+        else:
+            await connection.close(1013, "Lobby unavailable")
+            return
+
+        send_task = asyncio.create_task(writer(connection, player.outbox))
+        rate_window = time.monotonic()
+        messages = 0
         async for raw in connection:
             now = time.monotonic()
             if now - rate_window > 1:
                 rate_window, messages = now, 0
             messages += 1
-            if messages > 35:
+            if messages > 60:
                 await connection.close(1008, "Too many messages")
                 break
-            try:
-                message = json.loads(raw)
-            except (ValueError, UnicodeError):
-                continue
-            if isinstance(message, dict):
-                dispatch(pid, message)
-    except ConnectionClosed:
+            if pid not in players:
+                break
+            dispatch(pid, decode(raw))
+    except (ConnectionClosed, TimeoutError):
         pass
     finally:
-        send_task.cancel()
-        if player.invitation:
-            end_invitation(player.invitation, "A player went offline.")
-        if player.match:
-            end_match(pid)
-        players.pop(pid, None)
-        if player.name:
-            presence()
-        await asyncio.gather(send_task, return_exceptions=True)
+        if send_task:
+            send_task.cancel()
+            await asyncio.gather(send_task, return_exceptions=True)
+            if pid in players and player.connection is connection:
+                player.connection = None
+                if player.match:
+                    player.timeout = asyncio.get_running_loop().call_later(
+                        RECONNECT_SECONDS, expire_player, pid
+                    )
+                    match_presence(player.match)
+                    presence()
+                else:
+                    expire_player(pid)
+
+
+def health_check(connection, request):
+    if request.path == "/healthz":
+        return connection.respond(HTTPStatus.OK, "Vyapaar lobby is ready.\n")
+    return None
 
 
 async def main():
     port = int(os.environ.get("PORT", "8765"))
     async with serve(connection_handler, "0.0.0.0", port, max_size=4096,
-                     ping_interval=20, ping_timeout=20):
+                     ping_interval=20, ping_timeout=20, process_request=health_check):
         print(f"Vyapaar lobby listening on port {port}", flush=True)
         await asyncio.Future()
 
