@@ -1,5 +1,12 @@
 """BUSINESS presence, invitations and match message relay."""
 import asyncio
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import re
+import sqlite3
+from pathlib import Path
 from dataclasses import dataclass, field
 import itertools
 import json
@@ -12,6 +19,10 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 MAX_USERS = 64
+ACCOUNT_DB = Path(os.environ.get("ACCOUNT_DB", "business_accounts.sqlite3"))
+DAILY_REWARD = 150
+STARTING_WALLET = 500
+INDIA_TIME = timezone(timedelta(hours=5, minutes=30))
 INVITE_SECONDS = 40
 RECONNECT_SECONDS = 45
 ids = itertools.count(1)
@@ -22,6 +33,7 @@ class Player:
     connection: object
     outbox: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(128))
     name: str = ""
+    account: str = ""
     invitation: int = 0
     match: int = 0
     token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
@@ -218,20 +230,91 @@ def end_match(pid):
     presence()
 
 
+def initialize_accounts():
+    ACCOUNT_DB.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(ACCOUNT_DB)) as db, db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                username TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                salt BLOB NOT NULL,
+                password_hash BLOB NOT NULL,
+                dollars INTEGER NOT NULL,
+                last_claim TEXT NOT NULL DEFAULT '',
+                streak INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+
+def authenticate(message):
+    username = message.get("username")
+    password = message.get("password")
+    if not isinstance(username, str) or not isinstance(password, str):
+        return None
+    username = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,18}", username) or not 8 <= len(password) <= 72:
+        return None
+    create = message.get("create") is True
+    with closing(sqlite3.connect(ACCOUNT_DB)) as db, db:
+        row = db.execute("SELECT salt, password_hash FROM accounts WHERE username = ?", (username,)).fetchone()
+        if create:
+            name = message.get("name")
+            if row or not isinstance(name, str):
+                return None
+            name = "".join(c for c in name.strip() if c.isprintable() and c != "#")[:18].strip()
+            if not name:
+                return None
+            salt = secrets.token_bytes(16)
+            digest = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1)
+            try:
+                db.execute(
+                    "INSERT INTO accounts (username, display_name, salt, password_hash, dollars) VALUES (?, ?, ?, ?, ?)",
+                    (username, name, salt, digest, STARTING_WALLET),
+                )
+            except sqlite3.IntegrityError:
+                return None
+        else:
+            salt = row[0] if row else bytes(16)
+            digest = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1)
+            if not row or not hmac.compare_digest(row[1], digest):
+                return None
+    return username
+
+
+def account_snapshot(username, claim=False):
+    day = datetime.now(INDIA_TIME).date()
+    today = day.isoformat()
+    yesterday = (day - timedelta(days=1)).isoformat()
+    with closing(sqlite3.connect(ACCOUNT_DB)) as db, db:
+        if claim:
+            db.execute("""
+                UPDATE accounts
+                SET dollars = dollars + ?, last_claim = ?,
+                    streak = CASE WHEN last_claim = ? THEN streak + 1 ELSE 1 END
+                WHERE username = ? AND last_claim != ?
+            """, (DAILY_REWARD, today, yesterday, username, today))
+        name, dollars, last_claim, streak = db.execute(
+            "SELECT display_name, dollars, last_claim, streak FROM accounts WHERE username = ?",
+            (username,),
+        ).fetchone()
+    return {"display_name": name, "dollars": dollars, "streak": streak,
+            "claimed": last_claim == today, "daily_amount": DAILY_REWARD}
+
+
+login_slots = asyncio.Semaphore(4)
+
+
 def dispatch(pid, message):
     p = players[pid]
     kind = message.get("type")
-    if kind == "hello" and not p.name:
-        name = message.get("name")
-        if isinstance(name, str):
-            p.name = ("".join(c for c in name if c.isprintable()).strip()[:18] or "Player") + f" #{pid}"
-            send(pid, {"type": "welcome", "id": pid, "name": p.name, "token": p.token})
-            presence()
-        return
     if not p.name:
         return
     if kind == "heartbeat":
         send(pid, {"type": "heartbeat"})
+    elif kind == "daily_bonus" and not p.match:
+        send(pid, {"type": "account", **account_snapshot(p.account, claim=True)})
+    elif kind == "account_status" and not p.match:
+        send(pid, {"type": "account", **account_snapshot(p.account)})
     elif kind == "ack":
         acknowledge(p, message.get("seq"))
     elif kind == "invite":
@@ -301,13 +384,27 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
-            if first.get("game_version") != 3:
+            if first.get("game_version") != 4:
                 await connection.send(json.dumps({"type": "update_required"}))
                 return
+            if login_slots.locked():
+                await connection.send(json.dumps({"type": "auth_error", "message": "Server is busy. Try again."}))
+                return
+            async with login_slots:
+                account = await asyncio.to_thread(authenticate, first)
+            if not account or any(p.account == account for p in players.values()):
+                await connection.send(json.dumps({
+                    "type": "auth_error",
+                    "message": "Account unavailable. Check the username and password, or close the other session.",
+                }))
+                return
+            profile = account_snapshot(account)
             pid = next(ids)
-            player = players[pid] = Player(connection)
+            player = players[pid] = Player(connection, account=account,
+                                            name=f"{profile['display_name']} #{pid}")
             sessions[player.token] = pid
-            dispatch(pid, first)
+            send(pid, {"type": "welcome", "id": pid, "name": player.name, "token": player.token, **profile})
+            presence()
         else:
             await connection.close(1013, "Lobby unavailable")
             return
@@ -351,6 +448,7 @@ def health_check(connection, request):
 
 
 async def main():
+    initialize_accounts()
     port = int(os.environ.get("PORT", "8765"))
     async with serve(connection_handler, "0.0.0.0", port, max_size=4096,
                      ping_interval=20, ping_timeout=20, process_request=health_check):
