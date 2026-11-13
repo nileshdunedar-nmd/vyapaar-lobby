@@ -53,7 +53,7 @@ EVENT_FORMATS = {
     "payment_ready": (int, int),
     "payment_approved": (int, int),
 }
-ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip"}
+ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip", "accept_sale", "decline_sale"}
 
 
 def valid_event(event, data):
@@ -301,6 +301,9 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
+            if first.get("game_version") != 2:
+                await connection.send(json.dumps({"type": "update_required"}))
+                return
             pid = next(ids)
             player = players[pid] = Player(connection)
             sessions[player.token] = pid
