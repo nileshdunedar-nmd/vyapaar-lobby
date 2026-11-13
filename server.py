@@ -301,7 +301,7 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
-            if first.get("game_version") != 2:
+            if first.get("game_version") != 3:
                 await connection.send(json.dumps({"type": "update_required"}))
                 return
             pid = next(ids)
