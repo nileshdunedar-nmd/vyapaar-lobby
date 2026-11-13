@@ -1,4 +1,4 @@
-"""Vyapaar presence, invitations and match message relay."""
+"""BUSINESS presence, invitations and match message relay."""
 import asyncio
 from dataclasses import dataclass, field
 import itertools
@@ -53,7 +53,7 @@ EVENT_FORMATS = {
     "payment_ready": (int, int),
     "payment_approved": (int, int),
 }
-ACTIONS = {"roll", "skip", "buy", "build"}
+ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip"}
 
 
 def valid_event(event, data):
@@ -343,7 +343,7 @@ async def connection_handler(connection):
 
 def health_check(connection, request):
     if request.path == "/healthz":
-        return connection.respond(HTTPStatus.OK, "Vyapaar lobby is ready.\n")
+        return connection.respond(HTTPStatus.OK, "BUSINESS lobby is ready.\n")
     return None
 
 
@@ -351,7 +351,7 @@ async def main():
     port = int(os.environ.get("PORT", "8765"))
     async with serve(connection_handler, "0.0.0.0", port, max_size=4096,
                      ping_interval=20, ping_timeout=20, process_request=health_check):
-        print(f"Vyapaar lobby listening on port {port}", flush=True)
+        print(f"BUSINESS lobby listening on port {port}", flush=True)
         await asyncio.Future()
 
 
