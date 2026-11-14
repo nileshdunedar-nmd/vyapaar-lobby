@@ -65,7 +65,7 @@ EVENT_FORMATS = {
     "payment_ready": (int, int),
     "payment_approved": (int, int),
 }
-ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip", "accept_sale", "decline_sale", "counter_sale", "accept_counter"}
+ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip", "accept_sale", "decline_sale", "counter_sale", "accept_counter", "take_loan", "loan_full", "loan_half", "loan_interest", "loan_default"}
 
 
 def valid_event(event, data):
@@ -415,7 +415,7 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
-            if first.get("game_version") != 6:
+            if first.get("game_version") != 8:
                 await connection.send(json.dumps({"type": "update_required"}))
                 return
             if login_slots.locked():
