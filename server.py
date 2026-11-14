@@ -65,7 +65,7 @@ EVENT_FORMATS = {
     "payment_ready": (int, int),
     "payment_approved": (int, int),
 }
-ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip", "accept_sale", "decline_sale"}
+ACTIONS = {"roll", "skip", "buy", "build", "rent", "pay", "cancel_skip", "accept_sale", "decline_sale", "counter_sale", "accept_counter"}
 
 
 def valid_event(event, data):
@@ -246,6 +246,37 @@ def initialize_accounts():
         """)
 
 
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS saved_logins (
+                digest BLOB PRIMARY KEY,
+                username TEXT NOT NULL,
+                expires INTEGER NOT NULL
+            )
+        """)
+
+
+def saved_account(token):
+    if not isinstance(token, str) or not 40 <= len(token) <= 60:
+        return None
+    digest = hashlib.sha256(token.encode()).digest()
+    with closing(sqlite3.connect(ACCOUNT_DB)) as db:
+        row = db.execute(
+            """SELECT s.username FROM saved_logins s JOIN accounts a ON a.username = s.username
+               WHERE s.digest = ? AND s.expires > ?""", (digest, int(time.time())),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def issue_login(username):
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    with closing(sqlite3.connect(ACCOUNT_DB)) as db, db:
+        db.execute("DELETE FROM saved_logins WHERE expires <= ? OR username = ?", (now, username))
+        db.execute("INSERT INTO saved_logins VALUES (?, ?, ?)",
+                   (hashlib.sha256(token.encode()).digest(), username, now + 30 * 86400))
+    return token
+
+
 def authenticate(message):
     username = message.get("username")
     password = message.get("password")
@@ -384,14 +415,19 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
-            if first.get("game_version") != 5:
+            if first.get("game_version") != 6:
                 await connection.send(json.dumps({"type": "update_required"}))
                 return
             if login_slots.locked():
                 await connection.send(json.dumps({"type": "auth_error", "message": "Server is busy. Try again."}))
                 return
+            saved = "login_token" in first
             async with login_slots:
-                account = await asyncio.to_thread(authenticate, first)
+                account = saved_account(first.get("login_token")) if saved else await asyncio.to_thread(authenticate, first)
+            if saved and not account:
+                await connection.send(json.dumps({"type": "auth_error", "clear_saved_login": True,
+                                                  "message": "Saved login expired. Sign in again."}))
+                return
             if not account or any(p.account == account for p in players.values()):
                 await connection.send(json.dumps({
                     "type": "auth_error",
@@ -403,7 +439,9 @@ async def connection_handler(connection):
             player = players[pid] = Player(connection, account=account,
                                             name=f"{profile['display_name']} #{pid}")
             sessions[player.token] = pid
-            send(pid, {"type": "welcome", "id": pid, "name": player.name, "token": player.token, **profile})
+            login_token = first["login_token"] if saved else issue_login(account)
+            send(pid, {"type": "welcome", "id": pid, "name": player.name, "token": player.token,
+                       "username": account, "login_token": login_token, **profile})
             presence()
         else:
             await connection.close(1013, "Lobby unavailable")
