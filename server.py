@@ -384,7 +384,7 @@ async def connection_handler(connection):
             match_presence(player.match)
             presence()
         elif first.get("type") == "hello" and len(players) < MAX_USERS:
-            if first.get("game_version") != 4:
+            if first.get("game_version") != 5:
                 await connection.send(json.dumps({"type": "update_required"}))
                 return
             if login_slots.locked():
